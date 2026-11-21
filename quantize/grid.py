@@ -9,9 +9,6 @@ Swing always lives in the closed interval [0, 1].  Grid arithmetic rounds to
 whole ticks, so callers may compare two positions with a tolerance of one
 tick (``abs(a - b) <= 1``); values that divide evenly are expected to match
 exactly.
-
-Every public function below is currently a failing stub: it raises
-``NotImplementedError`` until the implementation is repaired.
 """
 
 from __future__ import annotations
@@ -23,6 +20,32 @@ from typing import Mapping, Sequence
 
 class QuantizeError(ValueError):
     """Raised when a quantization request is structurally invalid."""
+
+
+def _clamp_unit(value: float) -> float:
+    """Clamp ``value`` into the closed interval [0, 1]."""
+    return min(1.0, max(0.0, float(value)))
+
+
+def _check_grid_config(ppq: int, division: int) -> None:
+    """Reject non-positive or misaligned grid configurations."""
+    if ppq <= 0:
+        raise QuantizeError(f"ppq must be positive, got {ppq}")
+    if division <= 0:
+        raise QuantizeError(f"division must be positive, got {division}")
+    if ppq % division != 0:
+        raise QuantizeError(f"division {division} does not divide ppq {ppq}")
+
+
+def _swing_offsets(length: int, spacing: int, swing: float) -> list[int]:
+    """Per-point delays: 1-based even positions, endpoint anchored."""
+    delay = round(_clamp_unit(swing) * spacing / 2)
+    offsets = [0] * length
+    for index in range(length):
+        position = index + 1  # 1-based
+        if position % 2 == 0 and index != length - 1:
+            offsets[index] = delay
+    return offsets
 
 
 def grid_ticks(ppq: int, division: int, swing: float) -> list[int]:
@@ -40,7 +63,11 @@ def grid_ticks(ppq: int, division: int, swing: float) -> list[int]:
     point by more than half a cell, swing=0 leaves the grid evenly spaced,
     and the last tick remains anchored at ``ppq``.
     """
-    raise NotImplementedError("grid_ticks")
+    _check_grid_config(ppq, division)
+    spacing = ppq // division
+    base = [index * spacing for index in range(division + 1)]
+    offsets = _swing_offsets(len(base), spacing, swing)
+    return [point + offset for point, offset in zip(base, offsets)]
 
 
 def snap(tick: int, grid: Sequence[int], strength: float) -> int:
@@ -54,7 +81,23 @@ def snap(tick: int, grid: Sequence[int], strength: float) -> int:
     tick within the one-tick rounding tolerance described in the module
     docstring.
     """
-    raise NotImplementedError("snap")
+    if len(grid) == 0:
+        raise QuantizeError("grid must contain at least one point")
+    for left, right in zip(grid, grid[1:]):
+        if right <= left:
+            raise QuantizeError("grid points must be strictly increasing")
+
+    strength = _clamp_unit(strength)
+    index = bisect.bisect_left(grid, tick)
+    if index == 0:
+        nearest = grid[0]
+    elif index == len(grid):
+        nearest = grid[-1]
+    else:
+        lower, upper = grid[index - 1], grid[index]
+        # Ties go to the lower grid point.
+        nearest = lower if tick - lower <= upper - tick else upper
+    return round(tick + (nearest - tick) * strength)
 
 
 def quantize_notes(
@@ -68,7 +111,14 @@ def quantize_notes(
     their input order.  The input list and its note dicts are not mutated.
     An empty input returns an empty list.
     """
-    raise NotImplementedError("quantize_notes")
+    quantized = [
+        {"tick": snap(note["tick"], grid, strength),
+         "dur": note["dur"],
+         "vel": note["vel"]}
+        for note in notes
+    ]
+    quantized.sort(key=lambda note: note["tick"])  # sort() is stable
+    return quantized
 
 
 def fix_overlaps(
@@ -88,7 +138,29 @@ def fix_overlaps(
     Returns a new list sorted by tick, stable within each chord.  The input is
     not mutated.
     """
-    raise NotImplementedError("fix_overlaps")
+    if min_gap < 0:
+        raise QuantizeError(f"min_gap must be non-negative, got {min_gap}")
+
+    ordered = sorted(
+        (dict(note) for note in notes), key=lambda note: note["tick"]
+    )
+    distinct_ticks = sorted({note["tick"] for note in ordered})
+
+    for note in ordered:
+        tick = note["tick"]
+        index = bisect.bisect_right(distinct_ticks, tick)
+        if index < len(distinct_ticks):
+            next_tick = distinct_ticks[index]
+            max_dur = next_tick - tick - min_gap
+            if max_dur < min_gap:
+                raise QuantizeError(
+                    f"note at tick {tick} cannot satisfy min_gap {min_gap} "
+                    f"before next note-on at {next_tick}"
+                )
+            note["dur"] = max(min_gap, min(note["dur"], max_dur))
+        else:
+            note["dur"] = max(min_gap, note["dur"])
+    return ordered
 
 
 def quantize_velocity(
@@ -103,7 +175,31 @@ def quantize_velocity(
     and duration are preserved.  Returns a new list in input order without
     sorting.  An empty input returns an empty list.
     """
-    raise NotImplementedError("quantize_velocity")
+    if not isinstance(steps, int) or steps < 2:
+        raise QuantizeError(f"steps must be an integer >= 2, got {steps}")
+    if not math.isfinite(curve) or curve <= 0:
+        raise QuantizeError(f"curve must be a finite number > 0, got {curve}")
+
+    layers = [
+        round(1 + 126 * (k / (steps - 1)) ** curve) for k in range(steps)
+    ]
+
+    quantized = []
+    for note in notes:
+        vel = note["vel"]
+        index = bisect.bisect_left(layers, vel)
+        if index == 0:
+            nearest = layers[0]
+        elif index == len(layers):
+            nearest = layers[-1]
+        else:
+            lower, upper = layers[index - 1], layers[index]
+            # Ties choose the lower layer.
+            nearest = lower if vel - lower <= upper - vel else upper
+        quantized.append(
+            {"tick": note["tick"], "dur": note["dur"], "vel": nearest}
+        )
+    return quantized
 
 
 def groove_offset(grid: Sequence[int], swing: float) -> list[int]:
@@ -116,7 +212,15 @@ def groove_offset(grid: Sequence[int], swing: float) -> list[int]:
     which stays anchored.  Every offset is therefore between 0 and half a
     grid cell.  The input grid is not modified.
     """
-    raise NotImplementedError("groove_offset")
+    if len(grid) < 2:
+        raise QuantizeError("grid must contain at least two points")
+    spacing = grid[1] - grid[0]
+    if spacing <= 0:
+        raise QuantizeError("grid points must be strictly increasing")
+    for left, right in zip(grid, grid[1:]):
+        if right - left != spacing:
+            raise QuantizeError("grid must be evenly spaced")
+    return _swing_offsets(len(grid), spacing, swing)
 
 
 def validate(
@@ -134,7 +238,20 @@ def validate(
     division is attempted, so callers can never divide by zero.  Invalid note
     values are reported, not raised.  Inputs are not mutated.
     """
-    raise NotImplementedError("validate")
+    if ppq <= 0:
+        raise QuantizeError(f"ppq must be positive, got {ppq}")
+    if division <= 0:
+        raise QuantizeError(f"division must be positive, got {division}")
+
+    problems: list[str] = []
+    for i, note in enumerate(notes):
+        if note["tick"] < 0:
+            problems.append(f"note {i}: negative tick")
+        if note["dur"] <= 0:
+            problems.append(f"note {i}: non-positive duration")
+    if ppq % division != 0:
+        problems.append(f"division {division} does not divide ppq {ppq}")
+    return problems
 
 
 def quantize_batch(
@@ -154,4 +271,21 @@ def quantize_batch(
     Otherwise the returned ordered dict follows the input track order, and
     each track's notes are quantized, tick-sorted and overlap-fixed.
     """
-    raise NotImplementedError("quantize_batch")
+    strength = config["strength"]
+    swing = config["swing"]
+    min_gap = config["min_gap"]
+
+    # Validate every track up front: all-or-nothing, no partial results.
+    for name, track in tracks.items():
+        problems = validate(track["notes"], track["ppq"], track["division"])
+        if problems:
+            raise QuantizeError(
+                f"track {name!r} is invalid: {'; '.join(problems)}"
+            )
+
+    result: dict[str, list[dict[str, int]]] = {}
+    for name, track in tracks.items():
+        grid = grid_ticks(track["ppq"], track["division"], swing)
+        quantized = quantize_notes(track["notes"], grid, strength)
+        result[name] = fix_overlaps(quantized, min_gap)
+    return result
